@@ -517,11 +517,11 @@ class PlacementDQNAgent:
         if metrics is not None:
             save_dict['metrics'] = metrics
             
-        # Add RNG states for reproducibility
+        # Add RNG states for reproducibility (PyTorch 2.6+ safe)
         save_dict['random_states'] = {
             'python': random.getstate(),
-            'numpy': np.random.get_state(),
-            'torch': torch.get_rng_state()
+            'torch': torch.get_rng_state().cpu().numpy().tolist(),  # Convert to safe list
+            # Skip NumPy RNG to avoid PyTorch 2.6 issues
         }
         
         torch.save(save_dict, path)
@@ -695,55 +695,76 @@ def train_placement_tetris(episodes=50000, save_every=5000, eval_every=1000, res
                 checkpoint_path = os.path.join("checkpoints", latest_file)
                 print(f"Loading checkpoint: {checkpoint_path}")
                 
+                checkpoint_loaded = False
+                
                 try:
+                    # Try safe loading first (PyTorch 2.6+)
                     checkpoint = torch.load(checkpoint_path, map_location=device)
-                    
-                    # Load agent state
-                    agent.q_net.load_state_dict(checkpoint['q_net'])
-                    agent.target_net.load_state_dict(checkpoint['target_net'])
-                    agent.optimizer.load_state_dict(checkpoint['optimizer'])
-                    
-                    # Handle epsilon
-                    if reset_epsilon:
-                        agent.steps = 0
-                        print("🔄 EPSILON RESET - Exploration re-enabled!")
-                    else:
-                        agent.steps = checkpoint.get('steps', 0)
-                    
-                    # CRITICAL: Restore episode number AND metrics
-                    if 'episode' in checkpoint:
-                        start_episode = checkpoint.get('episode', 0) + 1
-                        print(f"✅ Resumed from episode {start_episode}")
-                    else:
-                        print("⚠️ No episode info in checkpoint, starting from episode 1")
+                    print("✅ Loaded with safe mode")
+                    checkpoint_loaded = True
+                except Exception as safe_error:
+                    print(f"Safe load failed: {safe_error}")
+                    print("Trying unsafe load for older checkpoint...")
+                    try:
+                        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                        print("✅ Loaded with unsafe mode")
+                        checkpoint_loaded = True
+                    except Exception as unsafe_error:
+                        print(f"❌ All loading failed: {unsafe_error}")
+                        print("Starting fresh...")
+                        checkpoint_loaded = False
 
-                    if 'metrics' in checkpoint:
-                        metrics = checkpoint['metrics']
-                        episode_rewards = metrics.get('episode_rewards', [])
-                        episode_lines = metrics.get('episode_lines', [])
-                        episode_pieces = metrics.get('episode_pieces', [])
-                        
-                        print(f"✅ Loaded {len(episode_rewards)} episodes of history")
-                        
-                        # Show recent performance
-                        if len(episode_rewards) >= 100:
-                            recent_reward = np.mean(episode_rewards[-100:])
-                            recent_lines = np.mean(episode_lines[-100:])
-                            print(f"✅ Recent avg reward: {recent_reward:.2f}")
-                            print(f"✅ Recent avg lines: {recent_lines:.1f}")
-                    else:
-                        print("⚠️ No metrics in checkpoint - will build new history")
+                # If checkpoint loaded successfully, restore state
+                if checkpoint_loaded:
+                    try:
+                        # Load agent state
+                        agent.q_net.load_state_dict(checkpoint['q_net'])
+                        agent.target_net.load_state_dict(checkpoint['target_net'])
+                        agent.optimizer.load_state_dict(checkpoint['optimizer'])
 
-                    print(f"✅ Current epsilon: {agent.get_epsilon():.3f}")
-                    
-                except Exception as e:
-                    print(f"❌ Failed to load checkpoint: {e}")
-                    print("Starting fresh...")
-                    start_episode = 1
+                        # Handle epsilon
+                        if reset_epsilon:
+                            agent.steps = 0
+                            print("🔄 EPSILON RESET - Exploration re-enabled!")
+                        else:
+                            agent.steps = checkpoint.get('steps', 0)
+
+                        # CRITICAL: Restore episode number AND metrics
+                        if 'episode' in checkpoint:
+                            start_episode = checkpoint.get('episode', 0) + 1
+                            print(f"✅ Resumed from episode {start_episode}")
+                        else:
+                            print("⚠️ No episode info in checkpoint, starting from episode 1")
+
+                        if 'metrics' in checkpoint:
+                            metrics = checkpoint['metrics']
+                            episode_rewards = metrics.get('episode_rewards', [])
+                            episode_lines = metrics.get('episode_lines', [])
+                            episode_pieces = metrics.get('episode_pieces', [])
+                            
+                            print(f"✅ Loaded {len(episode_rewards)} episodes of history")
+                            
+                            # Show recent performance
+                            if len(episode_rewards) >= 100:
+                                recent_reward = np.mean(episode_rewards[-100:])
+                                recent_lines = np.mean(episode_lines[-100:])
+                                print(f"✅ Recent avg reward: {recent_reward:.2f}")
+                                print(f"✅ Recent avg lines: {recent_lines:.1f}")
+                        else:
+                            print("⚠️ No metrics in checkpoint - will build new history")
+
+                        print(f"✅ Current epsilon: {agent.get_epsilon():.3f}")
+                        
+                    except Exception as restore_error:
+                        print(f"❌ Failed to restore checkpoint data: {restore_error}")
+                        print("Starting fresh...")
+                        start_episode = 1
+                        episode_rewards = []
+                        episode_lines = []
+                        episode_pieces = []
     
     print("Training in progress...")
     start_time = time.time()
-    
     
     for episode in range(start_episode, episodes + 1):
         state = env.reset()
@@ -803,10 +824,14 @@ def train_placement_tetris(episodes=50000, save_every=5000, eval_every=1000, res
             eval_reward, eval_lines, eval_pieces = evaluate_agent(agent, episodes=10)
             print(f"EVAL - Reward: {eval_reward:.2f}, Lines: {eval_lines:.1f}, Pieces: {eval_pieces:.1f}")
         
-        # Save model
+        # Save model with metrics
         if episode % save_every == 0:
             os.makedirs("checkpoints", exist_ok=True)
-            agent.save(f"checkpoints/placement_tetris_ep{episode}.pth")
+            agent.save(f"checkpoints/placement_tetris_ep{episode}.pth", 
+                      episode=episode, 
+                      metrics={'episode_rewards': episode_rewards, 
+                              'episode_lines': episode_lines, 
+                              'episode_pieces': episode_pieces})
             print(f"Model saved at episode {episode}")
     
     return agent, episode_rewards, episode_lines
@@ -848,7 +873,7 @@ if __name__ == "__main__":
     
     # OPTION 1: Continue with better epsilon schedule (RECOMMENDED)
     agent, rewards, lines = train_placement_tetris(
-        episodes=50000,
+        episodes=100000,
         save_every=5000,
         eval_every=1000,
         resume=True,           # Load your existing progress
